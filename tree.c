@@ -10,12 +10,12 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
-
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
 #define MODE_FILE      0100644
@@ -23,7 +23,7 @@
 #define MODE_DIR       0040000
 
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
-
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 // Determine the object mode for a filesystem path.
 uint32_t get_file_mode(const char *path) {
     struct stat st;
@@ -129,9 +129,167 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+
+typedef struct {
+    uint32_t mode;
+    ObjectID hash;
+    char path[512];
+} FlatEntry;
+
+static int cmp_flat_entries(const void *a, const void *b) {
+    const FlatEntry *ea = (const FlatEntry *)a;
+    const FlatEntry *eb = (const FlatEntry *)b;
+    return strcmp(ea->path, eb->path);
+}
+
+static int load_flat_index(FlatEntry *entries, int *count_out) {
+    *count_out = 0;
+
+    FILE *fp = fopen(INDEX_FILE, "r");
+    if (!fp) {
+        return 0; /* empty index is fine */
+    }
+
+    while (*count_out < MAX_TREE_ENTRIES) {
+        FlatEntry *e = &entries[*count_out];
+        char hex[HASH_HEX_SIZE + 1];
+        unsigned long mtime_dummy;
+        unsigned long size_dummy;
+
+        int rc = fscanf(fp, "%o %64s %lu %lu %511[^\n]\n",
+                        &e->mode, hex, &mtime_dummy, &size_dummy, e->path);
+        if (rc == EOF) break;
+        if (rc != 5) {
+            fclose(fp);
+            return -1;
+        }
+
+        if (hex_to_hash(hex, &e->hash) != 0) {
+            fclose(fp);
+            return -1;
+        }
+
+        (*count_out)++;
+    }
+
+    fclose(fp);
+    qsort(entries, *count_out, sizeof(FlatEntry), cmp_flat_entries);
+    return 0;
+}
+
+static int write_tree_level(FlatEntry *entries, int count, const char *prefix, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    size_t prefix_len = strlen(prefix);
+    int i = 0;
+
+    while (i < count) {
+        const char *full = entries[i].path;
+
+        if (prefix_len > 0) {
+            if (strncmp(full, prefix, prefix_len) != 0 || full[prefix_len] != '/') {
+                i++;
+                continue;
+            }
+            full += prefix_len + 1; /* skip "prefix/" */
+        }
+
+        const char *slash = strchr(full, '/');
+
+        if (!slash) {
+            /* direct file */
+            TreeEntry *te = &tree.entries[tree.count++];
+            te->mode = entries[i].mode;
+            te->hash = entries[i].hash;
+            strncpy(te->name, full, sizeof(te->name) - 1);
+            te->name[sizeof(te->name) - 1] = '\0';
+            i++;
+        } else {
+            /* direct subdirectory */
+            size_t dir_len = (size_t)(slash - full);
+            char dir_name[256];
+            if (dir_len >= sizeof(dir_name)) return -1;
+            memcpy(dir_name, full, dir_len);
+            dir_name[dir_len] = '\0';
+
+            /* skip duplicate dir names already added at this level */
+            int already = 0;
+            for (int k = 0; k < tree.count; k++) {
+                if (tree.entries[k].mode == MODE_DIR &&
+                    strcmp(tree.entries[k].name, dir_name) == 0) {
+                    already = 1;
+                    break;
+                }
+            }
+
+            /* find contiguous range belonging to this subdir */
+            int j = i;
+            while (j < count) {
+                const char *p = entries[j].path;
+                if (prefix_len > 0) {
+                    if (strncmp(p, prefix, prefix_len) != 0 || p[prefix_len] != '/') break;
+                    p += prefix_len + 1;
+                }
+                if (strncmp(p, dir_name, dir_len) == 0 && p[dir_len] == '/') {
+                    j++;
+                } else {
+                    break;
+                }
+            }
+
+            if (!already) {
+                char child_prefix[512];
+                if (prefix_len == 0)
+                    snprintf(child_prefix, sizeof(child_prefix), "%s", dir_name);
+                else
+                    snprintf(child_prefix, sizeof(child_prefix), "%s/%s", prefix, dir_name);
+
+                ObjectID child_id;
+                if (write_tree_level(entries + i, j - i, child_prefix, &child_id) != 0) {
+                    return -1;
+                }
+
+                TreeEntry *te = &tree.entries[tree.count++];
+                te->mode = MODE_DIR;
+                te->hash = child_id;
+                strncpy(te->name, dir_name, sizeof(te->name) - 1);
+                te->name[sizeof(te->name) - 1] = '\0';
+            }
+
+            i = j;
+        }
+
+        if (tree.count >= MAX_TREE_ENTRIES) return -1;
+    }
+
+    void *data = NULL;
+    size_t len = 0;
+    if (tree_serialize(&tree, &data, &len) != 0) return -1;
+
+    int rc = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return rc;
+}
+
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    FlatEntry entries[MAX_TREE_ENTRIES];
+    int count = 0;
+
+    if (load_flat_index(entries, &count) != 0) return -1;
+
+    if (count == 0) {
+        Tree empty;
+        empty.count = 0;
+
+        void *data = NULL;
+        size_t len = 0;
+        if (tree_serialize(&empty, &data, &len) != 0) return -1;
+
+        int rc = object_write(OBJ_TREE, data, len, id_out);
+        free(data);
+        return rc;
+    }
+
+    return write_tree_level(entries, count, "", id_out);
 }
